@@ -2,7 +2,12 @@
 __pycache__/
 *.pyc
 .DS_Store
+.pytest_cache/
+.vscode/
 data/
+uploads/
 *.xlsx
 *.csv
-uploads/
+*.parquet
+*.feather
+*.duckdb
