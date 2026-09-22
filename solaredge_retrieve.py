@@ -36,10 +36,10 @@ import argparse
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -134,10 +134,6 @@ class SiteInfo:
     country: str
     installation_date: date | None
 
-    @property
-    def zoneinfo(self) -> ZoneInfo:
-        return ZoneInfo(self.timezone)
-
 
 class SolarEdgeClient:
     """Thin SolarEdge monitoring API client with retries and an on-disk cache."""
@@ -203,9 +199,6 @@ class SolarEdgeClient:
             return
         wait = 2**attempt
         self._console.print(f"  [yellow]{reason}. Retrying in {wait}s ({attempt}/{MAX_RETRIES})[/]")
-        # Imported lazily so the tests can run without sleeping.
-        import time
-
         time.sleep(wait)
 
     # -- endpoints ----------------------------------------------------------
@@ -741,7 +734,9 @@ def parse_years(tokens: list[str]) -> list[int]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--years",
         nargs="+",
