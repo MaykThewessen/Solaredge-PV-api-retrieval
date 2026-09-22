@@ -12,6 +12,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 from rich.console import Console
@@ -461,6 +462,183 @@ def test_site_without_timezone_is_rejected(monkeypatch):
 
     with pytest.raises(se.SolarEdgeError, match="timeZone"):
         client.site_info()
+
+
+# ── Meter dumps ──────────────────────────────────────────────────────────────
+
+SLOTS_PER_DAY = 96
+
+
+def clean_days(start: str, count: int, peak_kwh: float = 30.0) -> pd.DataFrame:
+    """`count` identical local days: a triangular solar arc over a flat load."""
+    index = pd.date_range(
+        pd.Timestamp(f"{start} 00:00", tz=TZ), periods=SLOTS_PER_DAY * count, freq="15min"
+    ).tz_convert("UTC")
+    slot = np.arange(len(index)) % SLOTS_PER_DAY
+    arc = np.clip(1.0 - np.abs(slot - 48) / 24.0, 0.0, None) * peak_kwh
+
+    df = pd.DataFrame(index=index)
+    df.index.name = "datetime_utc"
+    df["Production_kWh"] = arc
+    df["Consumption_kWh"] = 4.0
+    df["SelfConsumption_kWh"] = np.minimum(arc, 4.0)
+    df["FeedIn_kWh"] = df["Production_kWh"] - df["SelfConsumption_kWh"]
+    df["Purchased_kWh"] = df["Consumption_kWh"] - df["SelfConsumption_kWh"]
+    df["quality"] = se.QUALITY_OK
+    return df[[*se.METER_COLUMNS, "quality"]]
+
+
+def inject_dump(df: pd.DataFrame, starved: list[int], dump: int) -> pd.DataFrame:
+    """Move the energy of the `starved` intervals into `dump`, as a settling meter does."""
+    out = df.copy()
+    columns = [out.columns.get_loc(m) for m in se.METER_COLUMNS]
+    moved = out.iloc[starved, columns].sum().to_numpy()
+    out.iloc[starved, columns] = 0.0
+    out.iloc[dump, columns] = out.iloc[dump, columns].to_numpy() + moved
+    return out
+
+
+def run_correction(df: pd.DataFrame, site: se.SiteInfo) -> tuple[pd.DataFrame, pd.DataFrame]:
+    derived = se.add_derived_columns(df, TZ)
+    flagged = se.flag_implausible_production(derived, site)
+    return se.redistribute_dumps(flagged, site, QUIET)
+
+
+def test_dump_is_recognised_before_anything_is_corrected(site: se.SiteInfo):
+    """Without the nameplate flag there is nothing to anchor a correction on."""
+    raw = inject_dump(clean_days("2026-06-01", 5), starved=list(range(232, 240)), dump=240)
+    flagged = se.flag_implausible_production(se.add_derived_columns(raw, TZ), site)
+    assert (flagged["quality"] == se.QUALITY_IMPLAUSIBLE).sum() == 1
+
+
+def test_redistribution_conserves_the_day(site: se.SiteInfo):
+    """A dump moves energy inside a day. Putting it back must not change the day."""
+    clean = clean_days("2026-06-01", 5)
+    raw = inject_dump(clean, starved=list(range(232, 240)), dump=240)
+    fixed, _ = run_correction(raw, site)
+
+    day = slice(SLOTS_PER_DAY * 2, SLOTS_PER_DAY * 3)
+    for meter in se.MEASURED_METERS:
+        assert fixed[meter].iloc[day].sum() == pytest.approx(clean[meter].iloc[day].sum(), abs=0.01)
+
+
+def test_redistribution_leaves_no_interval_above_the_rating(site: se.SiteInfo):
+    raw = inject_dump(clean_days("2026-06-01", 5), starved=list(range(232, 240)), dump=240)
+    fixed, _ = run_correction(raw, site)
+
+    assert (fixed["Production_kW"] <= site.peak_power_kwp).all()
+    assert not (fixed["quality"] == se.QUALITY_IMPLAUSIBLE).any()
+
+
+def test_starved_intervals_recover_their_shape(site: se.SiteInfo):
+    """The whole point: the flat-zero run either side of the dump comes back."""
+    clean = clean_days("2026-06-01", 5)
+    raw = inject_dump(clean, starved=list(range(232, 240)), dump=240)
+    fixed, _ = run_correction(raw, site)
+
+    restored = fixed["Production_kWh"].iloc[232:241]
+    expected = clean["Production_kWh"].iloc[232:241]
+    assert restored.to_numpy() == pytest.approx(expected.to_numpy(), abs=0.01)
+
+
+def test_clean_days_are_left_untouched(site: se.SiteInfo):
+    raw = inject_dump(clean_days("2026-06-01", 5), starved=list(range(232, 240)), dump=240)
+    fixed, _ = run_correction(raw, site)
+
+    untouched = fixed.index < fixed.index[SLOTS_PER_DAY * 2]
+    assert (fixed.loc[untouched, "quality"] == se.QUALITY_OK).all()
+    pd.testing.assert_series_equal(
+        fixed.loc[untouched, "Production_kWh"], raw.loc[untouched, "Production_kWh"]
+    )
+
+
+def test_meter_identities_stay_exact_on_corrected_intervals(site: se.SiteInfo):
+    raw = inject_dump(clean_days("2026-06-01", 5), starved=list(range(232, 240)), dump=240)
+    fixed, _ = run_correction(raw, site)
+
+    touched = fixed[fixed["quality"] == se.QUALITY_REDISTRIBUTED]
+    assert len(touched) > 1
+    production = touched["Production_kWh"] - touched["SelfConsumption_kWh"] - touched["FeedIn_kWh"]
+    consumption = touched["Consumption_kWh"] - touched["SelfConsumption_kWh"] - touched["Purchased_kWh"]
+    assert production.abs().max() == pytest.approx(0.0, abs=1e-9)
+    assert consumption.abs().max() == pytest.approx(0.0, abs=1e-9)
+    assert (touched[list(se.METER_COLUMNS)] >= 0).all().all()
+
+
+def test_correction_log_pairs_every_replaced_value(site: se.SiteInfo):
+    raw = inject_dump(clean_days("2026-06-01", 5), starved=list(range(232, 240)), dump=240)
+    fixed, log = run_correction(raw, site)
+
+    assert len(log) == (fixed["quality"] == se.QUALITY_REDISTRIBUTED).sum()
+    assert (log["role"] == "dump").sum() == 1
+    assert log.index.equals(fixed.index[fixed["quality"] == se.QUALITY_REDISTRIBUTED])
+
+    for meter in se.METER_COLUMNS:
+        name = meter.removesuffix("_kWh")
+        assert log[f"{name}_original_kWh"].to_numpy() == pytest.approx(
+            raw.loc[log.index, meter].to_numpy()
+        )
+        assert log[f"{name}_corrected_kWh"].to_numpy() == pytest.approx(
+            fixed.loc[log.index, meter].to_numpy()
+        )
+        delta = log[f"{name}_corrected_kWh"] - log[f"{name}_original_kWh"]
+        assert log[f"{name}_delta_kWh"].to_numpy() == pytest.approx(delta.to_numpy(), abs=1e-4)
+
+
+def test_nothing_to_correct_means_no_log(site: se.SiteInfo):
+    fixed, log = run_correction(clean_days("2026-06-01", 3), site)
+    assert log.empty
+    assert (fixed["quality"] == se.QUALITY_OK).all()
+
+
+def test_dump_without_a_reference_day_keeps_its_flag(site: se.SiteInfo):
+    """One lone day gives nothing to build a shape from, so the values stand."""
+    raw = inject_dump(clean_days("2026-06-01", 1), starved=list(range(40, 48)), dump=48)
+    fixed, log = run_correction(raw, site)
+
+    assert log.empty
+    assert (fixed["quality"] == se.QUALITY_IMPLAUSIBLE).sum() == 1
+    pd.testing.assert_series_equal(fixed["Production_kWh"], raw["Production_kWh"])
+
+
+def test_recovery_window_stops_at_a_healthy_interval():
+    observed = np.array([10.0, 10.0, 1.0, 99.0, 1.0, 10.0, 10.0])
+    expected = np.full(7, 10.0)
+    assert se.recovery_window(observed, expected, dump=3) == (2, 4)
+
+
+def test_recovery_window_stops_at_the_next_burst():
+    """A catch-up burst reads above its reference, so it closes the window."""
+    observed = np.array([1.0, 30.0, 99.0, 1.0, 1.0])
+    expected = np.full(5, 10.0)
+    assert se.recovery_window(observed, expected, dump=2) == (2, 4)
+
+
+def test_recovery_window_never_grows_past_the_bound():
+    observed = np.full(200, 0.0)
+    expected = np.full(200, 10.0)
+    lo, hi = se.recovery_window(observed, expected, dump=100)
+    assert (100 - lo, hi - 100) == (se.RECOVERY_SPAN_MAX, se.RECOVERY_SPAN_MAX)
+
+
+def test_recovery_window_ignores_nan_neighbours():
+    observed = np.array([0.0, np.nan, 0.0, 99.0, 0.0, np.nan, 0.0])
+    expected = np.full(7, 10.0)
+    assert se.recovery_window(observed, expected, dump=3) == (2, 4)
+
+
+def test_reshape_window_conserves_the_total():
+    values = pd.Series([50.0, 0.0, 0.0, 0.0])
+    weights = pd.Series([1.0, 2.0, 1.0, 1.0])
+    out = se.reshape_window(values, weights)
+    assert out.sum() == pytest.approx(50.0)
+    assert out.tolist() == [10.0, 20.0, 10.0, 10.0]
+
+
+def test_reshape_window_falls_back_to_a_flat_spread():
+    """A meter that is dark all window has no shape to borrow, so split it evenly."""
+    out = se.reshape_window(pd.Series([8.0, 0.0]), pd.Series([0.0, 0.0]))
+    assert out.tolist() == [4.0, 4.0]
 
 
 # ── End to end, offline ──────────────────────────────────────────────────────

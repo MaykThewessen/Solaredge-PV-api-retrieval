@@ -23,6 +23,15 @@ makes its output ambiguous twice a year:
 The canonical index is therefore tz-aware UTC. Local time is carried alongside
 as a convenience column for Excel.
 
+Meter dumps
+-----------
+Now and then the meter under-reports for a stretch and then settles up, booking
+the backlog into a single slot. When that slot exceeds what the array can
+physically produce it is provably wrong, and the intervals it borrowed from are
+rewritten alongside it from the shape of nearby days. Energy is conserved over
+the window, so daily and annual totals do not move; only the sub-hourly profile
+does. Every replaced value is written to a `_corrections.csv` log.
+
 Usage:
     python solaredge_retrieve.py                      # current year
     python solaredge_retrieve.py --years 2025
@@ -41,6 +50,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -57,6 +67,11 @@ METERS = ("Production", "Consumption", "SelfConsumption", "FeedIn", "Purchased")
 
 #: Canonical column order for output, independent of the order the API replies in.
 METER_COLUMNS = tuple(f"{m}_kWh" for m in METERS)
+
+#: The meters reshaped on their own reference shape when a dump is corrected.
+#: FeedIn and Purchased are derived from these three afterwards, which is what
+#: keeps both meter identities exact on the corrected intervals.
+MEASURED_METERS = ("Production_kWh", "Consumption_kWh", "SelfConsumption_kWh")
 
 #: Intervals per hour at the resolution we request.
 INTERVALS_PER_HOUR = 4
@@ -77,16 +92,36 @@ REQUEST_TIMEOUT = 30
 #: which is what would actually move if a meter were reconfigured.
 METER_IDENTITY_TOLERANCE = 0.005  # 0.5 %
 
+#: An interval joins the recovery window around a dump while it reports less
+#: than this share of its reference value. A catch-up burst reads well above 1,
+#: which is what closes the window on that side.
+RECOVERY_RATIO = 0.7
+
+#: Nearest fully reported days either side that build the reference shape.
+REFERENCE_DAYS = 3
+
+#: Hard bound on how far a recovery window may grow either side of the dump, so
+#: a genuinely dark afternoon cannot swallow the whole day.
+RECOVERY_SPAN_MAX = 4 * 6  # six hours
+
 QUALITY_OK = "ok"
 QUALITY_SPLIT = "dst_ambiguous_split"
 QUALITY_MISSING = "missing"
 QUALITY_IMPLAUSIBLE = "above_dc_rating"
+QUALITY_REDISTRIBUTED = "redistributed"
 
-QUALITY_FLAGS = (QUALITY_OK, QUALITY_SPLIT, QUALITY_IMPLAUSIBLE, QUALITY_MISSING)
+QUALITY_FLAGS = (
+    QUALITY_OK,
+    QUALITY_SPLIT,
+    QUALITY_REDISTRIBUTED,
+    QUALITY_IMPLAUSIBLE,
+    QUALITY_MISSING,
+)
 
 QUALITY_STYLES = {
     QUALITY_OK: "green",
     QUALITY_SPLIT: "yellow",
+    QUALITY_REDISTRIBUTED: "cyan",
     QUALITY_IMPLAUSIBLE: "red",
     QUALITY_MISSING: "red",
 }
@@ -494,7 +529,7 @@ def add_derived_columns(df: pd.DataFrame, tz: str) -> pd.DataFrame:
     return out
 
 
-# ── Validation ───────────────────────────────────────────────────────────────
+# ── Flagging ─────────────────────────────────────────────────────────────────
 
 
 def flag_implausible_production(df: pd.DataFrame, site: SiteInfo) -> pd.DataFrame:
@@ -502,9 +537,9 @@ def flag_implausible_production(df: pd.DataFrame, site: SiteInfo) -> pd.DataFram
     Mark intervals whose average power exceeds the DC nameplate rating.
 
     A 15-minute average above installed DC capacity cannot happen physically. In
-    practice it is the inverter booking a communication backlog into one slot.
-    The values are left untouched and only labelled, because deciding what the
-    real profile was is the analyst's call, not this script's.
+    practice it is the meter booking a backlog into one slot. This only labels
+    them; `redistribute_dumps` is what spreads the energy back afterwards, and
+    anything it could not correct keeps this flag.
     """
     if site.peak_power_kwp <= 0:
         return df
@@ -513,6 +548,213 @@ def flag_implausible_production(df: pd.DataFrame, site: SiteInfo) -> pd.DataFram
     over = (out["Production_kW"] > site.peak_power_kwp) & (out["quality"] == QUALITY_OK)
     out.loc[over, "quality"] = QUALITY_IMPLAUSIBLE
     return out
+
+
+# ── Meter dumps ──────────────────────────────────────────────────────────────
+
+
+def local_day_and_slot(index: pd.DatetimeIndex, tz: str) -> tuple[np.ndarray, np.ndarray]:
+    """Local calendar day and wall-clock slot of every interval."""
+    local = index.tz_convert(tz)
+    return (
+        local.normalize().tz_localize(None).to_numpy(),
+        local.strftime("%H:%M").to_numpy(),
+    )
+
+
+def reference_profile(
+    df: pd.DataFrame, days: np.ndarray, slots: np.ndarray, target_day: np.datetime64
+) -> pd.DataFrame | None:
+    """
+    What each meter would be expected to deliver per interval on `target_day`.
+
+    The reference is built in shares of a daily total, not in kWh, so it follows
+    the weather: an overcast day is measured against the *shape* of the clear
+    days around it rather than against their level. Scaling those shares by the
+    target day's own total then leaves its daily energy untouched, which is the
+    whole point, since a dump moves energy within a day without creating any.
+
+    Returns None when no nearby day is clean enough to build a shape from.
+    """
+    day_index = pd.Index(days)
+    clean = pd.Series(df["quality"].to_numpy() == QUALITY_OK).groupby(day_index).all()
+    lit = df["Production_kWh"].groupby(day_index).sum() > 0
+
+    candidates = clean.index[(clean & lit).to_numpy()]
+    candidates = candidates[candidates != target_day]
+    if len(candidates) == 0:
+        return None
+
+    nearest = candidates[np.argsort(np.abs(candidates - target_day))][: REFERENCE_DAYS * 2]
+
+    picked = np.isin(days, nearest)
+    sample = df.loc[picked, list(METER_COLUMNS)]
+    totals = sample.groupby(pd.Index(days[picked])).transform("sum")
+    shape = sample.div(totals.where(totals > 0)).groupby(pd.Index(slots[picked])).mean()
+
+    on_target = days == target_day
+    expected = shape.reindex(slots[on_target]).mul(
+        df.loc[on_target, list(METER_COLUMNS)].sum(), axis=1
+    )
+    expected.index = df.index[on_target]
+    return expected
+
+
+def recovery_window(observed: np.ndarray, expected: np.ndarray, dump: int) -> tuple[int, int]:
+    """
+    Grow a window outwards from a dump while its neighbours read too low.
+
+    It stops at the first interval that reports its expected share or more,
+    which is either a healthy interval or the next catch-up burst. The dump
+    itself is always inside the window: it is the one value known to be wrong.
+    """
+
+    def under(i: int) -> bool:
+        return bool(
+            np.isfinite(observed[i])
+            and np.isfinite(expected[i])
+            and expected[i] > 0
+            and observed[i] < RECOVERY_RATIO * expected[i]
+        )
+
+    lo = hi = dump
+    while lo > 0 and dump - lo < RECOVERY_SPAN_MAX and under(lo - 1):
+        lo -= 1
+    while hi < len(observed) - 1 and hi - dump < RECOVERY_SPAN_MAX and under(hi + 1):
+        hi += 1
+    return lo, hi
+
+
+def reshape_window(values: pd.Series, weights: pd.Series) -> pd.Series:
+    """Spread the window's reported total over it using the reference shape."""
+    usable = weights.where(np.isfinite(weights) & (weights > 0), 0.0)
+    if usable.sum() <= 0:  # nothing to shape with, e.g. a meter that is dark all window
+        usable = pd.Series(1.0, index=values.index)
+    return (usable / usable.sum() * float(values.sum(skipna=True))).round(ENERGY_DECIMALS)
+
+
+def correction_log(
+    before: pd.DataFrame, after: pd.DataFrame, dump: pd.Timestamp, window: int, tz: str
+) -> pd.DataFrame:
+    """One row per rewritten interval: what it held, what it holds now."""
+    stamps, offsets = local_time_columns(pd.DatetimeIndex(before.index), tz)
+
+    log = pd.DataFrame(index=before.index)
+    log.index.name = "datetime_utc"
+    log["window"] = window
+    log["datetime_local"] = stamps
+    log["utc_offset"] = offsets
+    log["role"] = np.where(before.index == dump, "dump", "recovery")
+
+    for meter in METER_COLUMNS:
+        name = meter.removesuffix("_kWh")
+        log[f"{name}_original_kWh"] = before[meter]
+        log[f"{name}_corrected_kWh"] = after[meter]
+        log[f"{name}_delta_kWh"] = (after[meter] - before[meter]).round(ENERGY_DECIMALS)
+
+    return log
+
+
+def redistribute_dumps(
+    df: pd.DataFrame, site: SiteInfo, console: Console
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Spread accumulated meter dumps back over the intervals they borrowed from.
+
+    A dump is an interval reporting more than the array can physically make, so
+    it is wrong beyond argument. The intervals around it read far below what the
+    same clock time gives on nearby days, because the meter under-reported them
+    and then settled up in one slot. Both are rewritten with the reference
+    shape, scaled so the window keeps exactly the energy it reported: daily and
+    annual totals do not move, only the sub-hourly profile does.
+
+    Production, Consumption and SelfConsumption are reshaped on their own
+    shapes, since a load profile looks nothing like a solar one. FeedIn and
+    Purchased then follow from them, so the meter identities stay exact.
+
+    Returns the corrected frame and a log of every value replaced.
+    """
+    dumps = np.flatnonzero(df["quality"].to_numpy() == QUALITY_IMPLAUSIBLE)
+    if len(dumps) == 0:
+        return df, pd.DataFrame()
+
+    out = df.copy()
+    days, slots = local_day_and_slot(pd.DatetimeIndex(df.index), site.timezone)
+    logs: list[pd.DataFrame] = []
+    done: set[int] = set()
+
+    for dump in dumps:
+        if int(dump) in done:
+            continue
+
+        expected = reference_profile(df, days, slots, days[dump])
+        if expected is None:
+            console.print(
+                f"  [red]No clean day near {df.index[dump]:%Y-%m-%d} to build a reference "
+                "from. Leaving that dump as reported.[/]"
+            )
+            continue
+
+        on_day = np.flatnonzero(days == days[dump])
+        lo, hi = recovery_window(
+            df["Production_kWh"].to_numpy()[on_day],
+            expected["Production_kWh"].to_numpy(),
+            int(np.flatnonzero(on_day == dump)[0]),
+        )
+        window = on_day[lo : hi + 1]
+        index = df.index[window]
+
+        before = df.loc[index, list(METER_COLUMNS)]
+        after = before.copy()
+        for meter in MEASURED_METERS:
+            after[meter] = reshape_window(before[meter], expected.loc[index, meter])
+
+        # Self-consumption cannot exceed either side of it in any interval.
+        self_used = after[list(MEASURED_METERS)].min(axis=1).round(ENERGY_DECIMALS)
+        after["SelfConsumption_kWh"] = self_used
+        after["FeedIn_kWh"] = (after["Production_kWh"] - self_used).round(ENERGY_DECIMALS)
+        after["Purchased_kWh"] = (after["Consumption_kWh"] - self_used).round(ENERGY_DECIMALS)
+
+        out.loc[index, list(METER_COLUMNS)] = after
+        out.loc[index, "quality"] = QUALITY_REDISTRIBUTED
+        done.update(int(p) for p in window)
+        logs.append(correction_log(before, after, df.index[dump], len(logs) + 1, site.timezone))
+
+    if "Production_kW" in out.columns:
+        out["Production_kW"] = (out["Production_kWh"] * INTERVALS_PER_HOUR).round(POWER_DECIMALS)
+
+    return out, pd.concat(logs) if logs else pd.DataFrame()
+
+
+def report_corrections(log: pd.DataFrame, console: Console) -> None:
+    """Show what each dump did and how far its correction reached."""
+    if log.empty:
+        return
+
+    table = Table(title="Meter dumps redistributed", title_justify="left", header_style="bold")
+    table.add_column("Window")
+    table.add_column("Intervals", justify="right")
+    table.add_column("Dumped (kWh)", justify="right")
+    table.add_column("Moved (kWh)", justify="right")
+
+    for window, rows in log.groupby("window", sort=True):
+        dump = rows[rows["role"] == "dump"].iloc[0]
+        moved = rows["Production_delta_kWh"].clip(lower=0).sum()
+        table.add_row(
+            f"{rows['datetime_local'].iloc[0]} to {rows['datetime_local'].iloc[-1]}",
+            str(len(rows)),
+            f"{dump['Production_original_kWh']:.1f}",
+            f"{moved:.1f}",
+        )
+
+    console.print(table)
+    console.print(
+        "  [dim]Window totals unchanged. Corrected intervals carry quality "
+        f"'{QUALITY_REDISTRIBUTED}'; every replaced value is in the corrections log.[/]"
+    )
+
+
+# ── Validation ───────────────────────────────────────────────────────────────
 
 
 def check_completeness(df: pd.DataFrame, site: SiteInfo, console: Console) -> None:
@@ -679,7 +921,7 @@ def build_compact(df: pd.DataFrame, tz: str) -> pd.DataFrame:
 
 
 def save_outputs(
-    df: pd.DataFrame, site: SiteInfo, year: int, console: Console
+    df: pd.DataFrame, log: pd.DataFrame, site: SiteInfo, year: int, console: Console
 ) -> list[Path]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     base = output_basename(site, year)
@@ -714,6 +956,14 @@ def save_outputs(
     compact_path = DATA_DIR / f"{base}_compact.csv"
     compact_frame.to_csv(compact_path, sep=";", decimal=",")
     note(compact_path, len(compact_frame))
+
+    # Audit trail: what every redistributed interval held before and after.
+    if not log.empty:
+        log_frame = log.copy()
+        log_frame.index = log_frame.index.strftime("%Y-%m-%dT%H:%M:%SZ")
+        log_path = DATA_DIR / f"{base}_corrections.csv"
+        log_frame.to_csv(log_path, sep=";", decimal=",")
+        note(log_path, len(log_frame))
 
     return written
 
@@ -824,11 +1074,13 @@ def main(argv: list[str] | None = None) -> int:
         df = build_full_timeseries(raw, year, site.timezone)
         df = add_derived_columns(df, site.timezone)
         df = flag_implausible_production(df, site)
+        df, corrections = redistribute_dumps(df, site, console)
 
         check_completeness(df, site, console)
+        report_corrections(corrections, console)
         check_meter_identities(df, console)
         summarise(df, site, year, console)
-        save_outputs(df, site, year, console)
+        save_outputs(df, corrections, site, year, console)
 
     return 1 if failures else 0
 

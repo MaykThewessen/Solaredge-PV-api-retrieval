@@ -66,18 +66,42 @@ Every row carries a `quality` flag.
 | --- | --- |
 | `ok` | Reported normally |
 | `dst_ambiguous_split` | Half of a fall-back interval that the API summed |
-| `above_dc_rating` | Average power exceeds installed DC capacity, so physically impossible |
+| `redistributed` | Rewritten around a meter dump, see below |
+| `above_dc_rating` | Average power exceeds installed DC capacity, and no reference day was available to correct it |
 | `missing` | No reading. Values stay `NaN` |
 
 Gaps are never filled with zero, because a dead inverter and a night-time zero are not the same
 reading. Pandas sums skip `NaN` and Excel ignores blank cells, so totals are unaffected.
 
-`above_dc_rating` catches the inverter booking a communication backlog into a single slot. On
-this site that is 2 intervals across 2019, 2025 and 2026, carrying about 69 kWh of production
-the array cannot physically make. Both clean years peak around 115 to 122 kW against a 155.5 kW
-nameplate, so the threshold has room and does not fire on real summer peaks. Flagged values are
-left exactly as reported: deciding what the true profile was is an analyst's call, not the
-script's. The annual summary reports peak power over unflagged intervals only.
+## Meter dumps
+
+Now and then the meter under-reports for a stretch and then settles up, booking the backlog into
+a single slot. When that slot exceeds what the array can physically produce it is wrong beyond
+argument, and the intervals it borrowed from give it away: they read far below what the same
+clock time delivers on nearby days.
+
+The correction grows a window outwards from the dump while that holds, stopping at the first
+interval that reports its expected share or more. Every meter in the window is then rewritten
+with the shape of the nearest fully reported days, scaled so the window keeps exactly the energy
+it reported. **Daily and annual totals do not move. Only the sub-hourly profile does.**
+
+Production, Consumption and SelfConsumption are reshaped on their own reference shapes, since a
+load profile looks nothing like a solar one. FeedIn and Purchased are derived from them, which is
+what keeps both meter identities exact on the corrected intervals.
+
+The reference is built in shares of a daily total rather than in kWh, so it follows the weather:
+an overcast day is measured against the *shape* of the clear days around it, not their level.
+Without that, every cloudy afternoon would look under-reported.
+
+Two limits worth knowing:
+
+- A catch-up burst that stays **under** the nameplate rating is never detected. Apr 22 2026 has
+  one at 17:15 (28.6 kWh where ~16 was due) that goes uncorrected, because no physical bound is
+  violated. The flag is deliberately anchored on what is provably impossible.
+- Where the energy belongs is only well evidenced for the meter that shows the deficit. On
+  2026-09-08 production collapses to near zero after the dump, which pins it down; consumption
+  reports plausible values throughout, so spreading its share over the same window is an
+  assumption, not a measurement. The log makes it auditable.
 
 ## Output
 
@@ -89,13 +113,20 @@ Written to `data/`, named `solaredge_<year>_<kWp>kWp_*`:
 | `_15min.csv` | Excel-friendly: `;` separator, `,` decimals, UTC as ISO-8601 text. |
 | `_15min.xlsx` | Same content. Skipped with a warning if OneDrive holds the file open. |
 | `_compact.csv` | Production only, non-zero intervals plus one zero row either side of each block. |
+| `_corrections.csv` | Audit log of every value a meter-dump correction replaced. Written only when there was one. |
 
 Columns: `datetime_utc` (index), `datetime_local`, `utc_offset`, the five meters in kWh,
 `Production_kW`, and `quality`.
 
-Each run also prints a data-quality table, the two meter identity checks
-(`Production = SelfConsumption + FeedIn` and `Consumption = SelfConsumption + Purchased`)
-and an annual summary with specific yield and peak power.
+The corrections log carries one row per rewritten interval: `window` (which dump it belongs to),
+`role` (`dump` or `recovery`), and `<meter>_original_kWh`, `<meter>_corrected_kWh`,
+`<meter>_delta_kWh` for all five meters. Summing `_original_kWh` and `_corrected_kWh` per window
+is the check that the correction moved energy without creating it.
+
+Each run also prints a data-quality table, what each dump did and how far its correction reached,
+the two meter identity checks (`Production = SelfConsumption + FeedIn` and
+`Consumption = SelfConsumption + Purchased`) and an annual summary with specific yield and peak
+power.
 
 ## Tests
 
