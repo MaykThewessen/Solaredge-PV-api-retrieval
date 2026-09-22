@@ -11,3 +11,5 @@ uploads/
 *.parquet
 *.feather
 *.duckdb
+*.ipynb
+*.mp3
